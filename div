@@ -1,0 +1,188 @@
+// ✅ generateBDD.js (نسخه نهایی امن برای Cucumber)
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+const swaggerUrl = "https://rad-sandbox.sandpod.ir/docs?api-docs.json";
+const baseApiUrl = "https://rad-sandbox.sandpod.ir";
+const outputDir = "./generated";
+const utilsDir = path.join(outputDir, "utils");
+const logDir = path.join(outputDir, "logs");
+
+// 🗂 ایجاد پوشه‌ها
+[outputDir, utilsDir, logDir].forEach((dir) => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+// 📁 فایل auth.js
+const authContent = `
+const axios = require('axios');
+const tokenUrl = 'https://sso-sandbox.sandpod.ir/oauth2/token';
+const clientId = 'YOUR_CLIENT_ID';
+const clientSecret = 'YOUR_CLIENT_SECRET';
+const username = 'YOUR_USERNAME';
+const password = 'YOUR_PASSWORD';
+
+async function getAccessToken() {
+  const res = await axios.post(tokenUrl, {
+    grant_type: 'password',
+    client_id: clientId,
+    client_secret: clientSecret,
+    username,
+    password
+  });
+  return res.data.access_token;
+}
+
+module.exports = { getAccessToken, clientId };
+`;
+fs.writeFileSync(path.join(utilsDir, "auth.js"), authContent);
+
+// 🎲 تولید مقدار تصادفی
+function randomValue(type) {
+  if (type === "integer" || type === "number") return Math.floor(Math.random() * 100000);
+  if (type === "boolean") return Math.random() < 0.5;
+  return `auto-${Math.random().toString(36).substring(2, 8)}`;
+}
+
+// 📋 دریافت پارامترهای ضروری
+function getRequiredParams(operation) {
+  const required = [];
+  if (operation.parameters)
+    operation.parameters.forEach((p) => {
+      if (p.required) required.push(p.name);
+    });
+  const body = operation.requestBody?.content?.["application/json"]?.schema;
+  if (body?.required) required.push(...body.required);
+  return [...new Set(required)];
+}
+
+// 🧾 پاک کردن لاگ قبل اجرا
+function clearLog(moduleName) {
+  const file = path.join(logDir, `${moduleName}.log`);
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+}
+
+// 🧾 لاگ‌نویسی
+function writeLog(moduleName, message) {
+  const timestamp = new Date().toISOString();
+  fs.appendFileSync(path.join(logDir, `${moduleName}.log`), `[${timestamp}] ${message}\n`);
+}
+
+// 📥 دریافت Swagger JSON
+async function getSwaggerJson(url) {
+  const res = await axios.get(url);
+  return res.data;
+}
+
+// 🚀 تولید فایل‌های Feature و Step
+async function generateBDD() {
+  const swagger = await getSwaggerJson(swaggerUrl);
+
+  for (const [apiPath, methods] of Object.entries(swagger.paths)) {
+    for (const [method, operation] of Object.entries(methods)) {
+      const tag = (operation.tags && operation.tags[0]) || "general";
+      const moduleName = tag.replace(/\s+/g, "-").toLowerCase();
+      const requiredParams = getRequiredParams(operation);
+      const summary = operation.summary || `${method.toUpperCase()} ${apiPath}`;
+
+      const moduleDir = path.join(outputDir, moduleName);
+      const featureDir = path.join(moduleDir, "features");
+      const stepDir = path.join(moduleDir, "steps");
+      [moduleDir, featureDir, stepDir].forEach((d) => {
+        if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+      });
+
+      // اسم امن برای فایل‌ها و Feature (بدون {} و /)
+      const safeName = `${method}_${apiPath.replace(/[\/{}]/g, "_").replace(/__+/g, "_")}`;
+
+      const featureFile = path.join(featureDir, `${safeName}.feature`);
+      const stepFile = path.join(stepDir, `${safeName}.js`);
+
+      // 🧩 Feature
+      let featureContent = `
+Feature: ${summary}
+
+  Scenario: ${summary}
+    Given I have a valid access token
+    When I execute ${safeName}
+    Then the response status should be 200
+`;
+
+      // 🧠 Step
+      let stepContent = `
+const { Given, When, Then, setDefaultTimeout } = require('@cucumber/cucumber');
+const { expect } = require('chai');
+const axios = require('axios');
+const { getAccessToken, clientId } = require('../../utils/auth');
+const path = require('path');
+const fs = require('fs');
+setDefaultTimeout(60000);
+
+let accessToken = '';
+let response = {};
+let payload = {};
+let requiredValues = {};
+const moduleName = '${moduleName}';
+
+Given('I have a valid access token', async function() {
+  accessToken = await getAccessToken();
+  if (!fs.existsSync(path.join(__dirname, '../../../logs'))) fs.mkdirSync(path.join(__dirname, '../../../logs'), { recursive: true });
+  fs.writeFileSync(path.join(__dirname, '../../../logs', moduleName + '.log'), '');
+  fs.appendFileSync(path.join(__dirname, '../../../logs', moduleName + '.log'), '[START] Access token obtained\\n');
+});
+
+When('I execute ${safeName}', async function() {
+  // GET داخلی برای استخراج requiredValues
+  if (['put','patch','delete'].includes('${method.toLowerCase()}') && ${requiredParams.length} > 0) {
+    try {
+      const getRes = await axios.get(\`${baseApiUrl}${apiPath.replace(/\\{[^}]+\\}/g, '')}\`, {
+        headers: { 'Access-Token': accessToken, 'Client-Id': clientId }
+      });
+      const items = getRes.data.result || [];
+      if (!items.length) throw new Error('⚠️ No data found for GET.');
+      const first = items[Math.floor(Math.random() * items.length)];
+      ${requiredParams.map(p => `requiredValues['${p}'] = first['${p}'] ?? "${randomValue("string")}";`).join("\n      ")}
+      fs.appendFileSync(path.join(__dirname, '../../../logs', moduleName + '.log'), '[INFO] GET extracted values: ' + JSON.stringify(requiredValues) + '\\n');
+    } catch(err) {
+      fs.appendFileSync(path.join(__dirname, '../../../logs', moduleName + '.log'), '[ERROR] GET failed: ' + err.message + '\\n');
+    }
+  }
+
+  // Payload برای POST/PUT
+  if ('${method.toLowerCase()}' === 'post' || '${method.toLowerCase()}' === 'put') {
+    payload = {};
+    ${requiredParams.map(p => `payload['${p}'] = payload['${p}'] ?? requiredValues['${p}'] ?? "${randomValue("string")}";`).join("\n    ")}
+  }
+
+  try {
+    response = await axios({
+      method: '${method}',
+      url: \`${baseApiUrl}${apiPath.replace(/[{}]/g, '')}\`,
+      headers: { 'Access-Token': accessToken, 'Client-Id': clientId, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      data: Object.keys(payload).length ? payload : undefined
+    });
+    fs.appendFileSync(path.join(__dirname, '../../../logs', moduleName + '.log'), '[SUCCESS] Request executed: ' + JSON.stringify(payload) + ' | Status: ' + response.status + '\\n');
+  } catch(err) {
+    fs.appendFileSync(path.join(__dirname, '../../../logs', moduleName + '.log'), '[ERROR] Request failed: ' + err.message + '\\n');
+    throw err;
+  }
+});
+
+Then('the response status should be 200', function() {
+  expect(response.status).to.equal(200);
+  fs.appendFileSync(path.join(__dirname, '../../../logs', moduleName + '.log'), '[END] Response validated successfully\\n');
+});
+`;
+
+      // ذخیره فایل‌ها
+      fs.writeFileSync(featureFile, featureContent.trim());
+      fs.writeFileSync(stepFile, stepContent.trim());
+      writeLog(moduleName, `✅ BDD created for ${method.toUpperCase()} ${apiPath}`);
+    }
+  }
+
+  console.log("🎯 همه Feature و Stepها بدون خطا ساخته شدند!");
+}
+
+generateBDD().catch(console.error);
